@@ -1,0 +1,15 @@
+{
+  "name": "yt-hls-worker",
+  "version": "1.0.0",
+  "description": "Simple YouTube HLS worker for /yt.php?v=... or /yt.php?c=...",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
