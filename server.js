@@ -1,116 +1,133 @@
-// server.js
-// Simple YouTube HLS worker compatible with main.py
-//   GET /yt.php?v=VIDEO_ID   -> returns HLS (.m3u8) of that video (live)
-//   GET /yt.php?c=CHANNEL_ID -> returns HLS of channel live stream (if any)
+import express from "express";
 
-const express = require("express");
 const app = express();
-
 const PORT = process.env.PORT || 3000;
 
-// Sabit User-Agent (masaüstü Chrome)
-const DEFAULT_UA =
+const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-async function fetchText(url) {
+async function fetchText(url, allowRedirects = true) {
   const res = await fetch(url, {
+    redirect: allowRedirects ? "follow" : "manual",
     headers: {
-      "User-Agent": DEFAULT_UA,
+      "User-Agent": UA,
       "Accept-Language": "en-US,en;q=0.9"
     }
   });
 
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status} while fetching ${url}`);
+    throw new Error(`HTTP ${res.status} for ${url}`);
   }
 
   return await res.text();
 }
 
-/**
- * YouTube HTML içinden hlsManifestUrl çek
- * (ytInitialPlayerResponse içindeki alan)
- */
-function extractHlsUrlFromHtml(html) {
-  // "hlsManifestUrl":"...m3u8..."
-  const match = html.match(/"hlsManifestUrl":"(.*?)"/);
-  if (!match) return null;
+// -------------------------------------------------------------
+// 1) Kanal ID’den canlı video ID çıkar
+// -------------------------------------------------------------
+async function resolveLiveVideoId(channelId) {
+  const liveUrl = `https://www.youtube.com/channel/${channelId}/live`;
 
-  // JSON kaçışlarını çözmek için:
-  const raw = match[1];
-  let decoded;
-  try {
-    decoded = JSON.parse(`"${raw}"`); // \u0026 vs çözülür
-  } catch {
-    decoded = raw.replace(/\\u0026/g, "&");
+  const res1 = await fetch(liveUrl, {
+    redirect: "manual",
+    headers: { "User-Agent": UA }
+  });
+
+  // Redirect → canlı video linki
+  const loc = res1.headers.get("location");
+  if (loc && loc.includes("watch?v=")) {
+    const m = loc.match(/v=([^&]+)/);
+    if (m) return m[1];
   }
-  return decoded;
+
+  // Redirect yoksa sayfadan videoId ara
+  const html = await res1.text();
+  const m2 = html.match(/"videoId":"([A-Za-z0-9_-]{11})"/);
+  if (m2) return m2[1];
+
+  throw new Error("No live video found");
 }
 
-/**
- * Verilen video ya da kanal URL'sinden m3u8 manifestini al
- */
-async function getM3u8FromYoutubePage(pageUrl) {
-  const html = await fetchText(pageUrl);
+// -------------------------------------------------------------
+// 2) ytInitialPlayerResponse JSON’unu güçlü şekilde çıkar
+// -------------------------------------------------------------
+function extractPlayerJson(html) {
+  const patterns = [
+    /ytInitialPlayerResponse\s*=\s*({.+?});/s,
+    /var\s+ytInitialPlayerResponse\s*=\s*({.+?});/s,
+    /"ytInitialPlayerResponse":\s*({.+?})\s*,\s*"responseContext"/s
+  ];
 
-  const hlsUrl = extractHlsUrlFromHtml(html);
-  if (!hlsUrl) {
-    throw new Error("hlsManifestUrl not found (no live? or page changed)");
+  for (const p of patterns) {
+    const m = html.match(p);
+    if (m) {
+      try {
+        return JSON.parse(m[1]);
+      } catch (e) {
+        continue;
+      }
+    }
+  }
+  return null;
+}
+
+// -------------------------------------------------------------
+// 3) Video ID → HLS manifest getir
+// -------------------------------------------------------------
+async function getM3u8FromVideo(videoId) {
+  const watchUrl = `https://www.youtube.com/watch?v=${videoId}&hl=en&bpctr=9999999999`;
+
+  const html = await fetchText(watchUrl);
+
+  const data = extractPlayerJson(html);
+
+  if (!data || !data.streamingData || !data.streamingData.hlsManifestUrl) {
+    throw new Error("hlsManifestUrl not found");
   }
 
-  const manifest = await fetchText(hlsUrl);
+  let hls = data.streamingData.hlsManifestUrl;
+
+  // escape edilmişse düzelt
+  try {
+    hls = JSON.parse(`"${hls}"`);
+  } catch {}
+
+  const manifest = await fetchText(hls);
   return manifest;
 }
 
-// Ana endpoint: /yt.php
+// -------------------------------------------------------------
+// 4) API: /yt.php
+// -------------------------------------------------------------
 app.get("/yt.php", async (req, res) => {
-  const videoId = req.query.v;
-  const channelId = req.query.c;
-
-  if (!videoId && !channelId) {
-    return res.status(400).type("text/plain").send("Missing v or c parameter");
-  }
-
-  let pageUrl;
-
-  if (videoId) {
-    // Belirli video
-    pageUrl = `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`;
-  } else {
-    // Kanal canlı yayını
-    // Klasik kanal ID: UCxxxx...
-    // /live sayfası canlı yayına redirect ediyor veya live sayfasını veriyor
-    pageUrl = `https://www.youtube.com/channel/${encodeURIComponent(
-      channelId
-    )}/live`;
-  }
-
-  console.log(`[yt.php] Fetching page: ${pageUrl}`);
-
   try {
-    const manifest = await getM3u8FromYoutubePage(pageUrl);
+    let videoId = req.query.v;
+    const channelId = req.query.c;
 
-    // main.py m3u8 içeriğini direkt bekliyor
+    if (!videoId && !channelId) {
+      return res.status(400).send("Missing v= or c=");
+    }
+
+    if (!videoId && channelId) {
+      videoId = await resolveLiveVideoId(channelId);
+    }
+
+    const m3u8 = await getM3u8FromVideo(videoId);
+
     res
       .status(200)
       .type("application/vnd.apple.mpegurl; charset=utf-8")
-      .send(manifest);
-  } catch (err) {
-    console.error("[yt.php] Error:", err.message);
-
-    // Eğer canlı yoksa 404 dönelim
-    res
-      .status(404)
-      .type("text/plain; charset=utf-8")
-      .send("No live HLS manifest found or YouTube page changed.");
+      .send(m3u8);
+  } catch (e) {
+    console.log("[ERROR]", e.message);
+    res.status(404).type("text/plain").send("No live stream found.");
   }
 });
 
-// Basit sağlılık testi
 app.get("/", (req, res) => {
-  res.type("text/plain").send("YouTube HLS worker is running. Use /yt.php?v=... or /yt.php?c=...");
+  res.send("YouTube worker OK");
 });
 
 app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log("Server running on port " + PORT);
 });
