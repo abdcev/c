@@ -1,0 +1,32 @@
+name: ATV Link Updater
+
+on:
+  schedule:
+    - cron: '0 * * * *' # Her saatin başında çalışır
+  workflow_dispatch: # Manuel çalıştırmak için buton ekler
+
+jobs:
+  update-link:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install Puppeteer
+        run: npm install puppeteer
+
+      - name: Fetch ATV Link
+        run: node fetch_atv.js
+
+      - name: Commit and Push
+        run: |
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+          git add atv_link.txt
+          git commit -m "Update ATV Live Link: $(date)" || exit 0
+          git push
